@@ -50,11 +50,12 @@ If you did everything right you will now have your bot join your chosen guild an
 
 # Arguments for generator.py
 
-| Argument          | Type         | Default                               | Description                                                                                                       |
-| ----------------- | ------------ | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `--model_path`    | `str`        | `microsoft/VibeVoice-1.5b`            | Path or HuggingFace model identifier for the speech generation model.                                             |
-| `--speaker_names` | `str` (list) | `['boris']`                           | List of speaker names (in order) to assign to generated voices.                                                   |
-| `--output_dir`    | `str`        | `./outputs`                           | Directory where generated audio files will be saved.                                                              |
-| `--device`        | `str`        | Auto-detects (`cuda` → `mps` → `cpu`) | Device to use for inference. Choose between **cuda** (GPU), **mps** (Apple Silicon), or **cpu**.                  |
-| `--cfg_scale`     | `float`      | `1.3`                                 | Classifier-Free Guidance (CFG) scale. Higher values = stronger adherence to prompts, lower = more diverse output. |
-| `--watch_dir`     | `str`        | `./txt`                               | Directory to watch for new `.txt` files. Each new file triggers voice generation.                                 |
+| Argument          | Type         | Default                               | Description                                                                                                                                                        |
+| ----------------- | ------------ | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--model_path`    | `str`        | `microsoft/VibeVoice-1.5b`            | Path or HuggingFace model identifier for the speech generation model.                                                                                              |
+| `--speaker_names` | `str` (list) | `['boris']`                           | List of speaker names (in order) to assign to generated voices.                                                                                                    |
+| `--output_dir`    | `str`        | `./outputs`                           | Directory where generated audio files will be saved.                                                                                                               |
+| `--device`        | `str`        | Auto-detects (`cuda` → `mps` → `cpu`) | Device to use for inference. Choose between **cuda** (GPU), **mps** (Apple Silicon), or **cpu**.                                                                   |
+| `--cfg_scale`     | `float`      | `1.3`                                 | Classifier-Free Guidance (CFG) scale. Higher values = stronger adherence to prompts, lower = more diverse output.                                                  |
+| `--watch_dir`     | `str`        | `./txt`                               | Directory to watch for new `.txt` files. Each new file triggers voice generation.                                                                                  |
+| `--dtype`         | `str`        | `float32`                             | Torch data type for model weights. Options: **float32** (high precision), **float16** (lower memory, faster on GPUs), **bfloat16** (efficient on modern hardware). |
