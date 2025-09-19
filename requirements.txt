@@ -1,0 +1,4 @@
+torch
+watchdog
+transformers
+discord.py
