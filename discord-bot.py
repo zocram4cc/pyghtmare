@@ -6,6 +6,8 @@ from collections import deque
 import time
 import re
 import uuid
+import subprocess
+from discord.ext import voice_recv
 
 # Create a subfolder for model input
 if not os.path.exists("./txt"):
@@ -18,12 +20,16 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Configuration
-GUILD_ID = 0
-VOICE_CHANNEL_ID = 0
+GUILD_ID = int(os.environ.get("GUILD_ID", 0))
+VOICE_CHANNEL_ID = int(os.environ.get("VOICE_CHANNEL_ID", 0))
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "0")
 OUTPUTS_FOLDER = "./outputs"
 THROTTLE_TIME = 30 # seconds
 CHARACTER_LIMIT = 250
 is_muted = False
+local_playback_bot_enabled = os.environ.get('LOCAL_PLAYBACK_BOT', 'false').lower() in ('true', '1', 't')
+local_playback_channel_enabled = os.environ.get('LOCAL_PLAYBACK_CHANNEL', 'false').lower() in ('true', '1', 't')
+
 
 # User-specific message queues for throttling
 user_throttles = {}
@@ -46,8 +52,10 @@ async def check_voice_channel():
         voice_channel = guild.get_channel(VOICE_CHANNEL_ID)
         if voice_channel and isinstance(voice_channel, discord.VoiceChannel):
             try:
-                await voice_channel.connect()
+                vc = await voice_channel.connect(cls=voice_recv.VoiceRecvClient)
                 print(f"Joined voice channel: {voice_channel.name}")
+                if local_playback_channel_enabled:
+                    start_listening(vc)
             except Exception as e:
                 print(f"Failed to join voice channel: {e}")
     else:
@@ -79,6 +87,8 @@ async def play_audio_from_queue():
                 filepath = item['path']
                 print(f"Playing audio file: {filepath}")
 
+                if local_playback_bot_enabled:
+                    subprocess.Popen(['paplay', filepath])
 
                 def after_playing(error):
                     if error:
@@ -119,6 +129,66 @@ async def unmute(ctx):
     await ctx.send("Bot voice playback has been unmuted.")
     print(f"{ctx.author} has unmuted the bot.")
 
+class PaplaySink(voice_recv.AudioSink):
+    def __init__(self):
+        self.proc = subprocess.Popen(['paplay', '--raw', '--channels=2', '--rate=48000', '--format=s16le'], stdin=subprocess.PIPE)
+
+    def wants_opus(self):
+        return False
+
+    def write(self, user, data):
+        if self.proc.stdin:
+            self.proc.stdin.write(data.pcm)
+
+    def cleanup(self):
+        self.proc.kill()
+
+def start_listening(voice_client):
+    sink = PaplaySink()
+    voice_client.listen(sink)
+    voice_client.sink = sink
+
+def stop_listening(voice_client):
+    if hasattr(voice_client, 'sink') and voice_client.sink:
+        voice_client.sink.cleanup()
+        voice_client.sink = None
+    voice_client.stop_listening()
+
+@bot.command()
+@commands.has_permissions(stream=True)
+async def local_playback_bot(ctx, state: str):
+    """Enables or disables local playback of the bot's audio. Usage: !local_playback_bot <on|off>"""
+    global local_playback_bot_enabled
+    if state.lower() == 'on':
+        local_playback_bot_enabled = True
+        await ctx.send("Local playback of bot audio enabled.")
+    elif state.lower() == 'off':
+        local_playback_bot_enabled = False
+        await ctx.send("Local playback of bot audio disabled.")
+    else:
+        await ctx.send("Invalid state. Use 'on' or 'off'.")
+
+@bot.command()
+@commands.has_permissions(stream=True)
+async def local_playback_channel(ctx, state: str):
+    """Enables or disables local playback of the voice channel's audio. Usage: !local_playback_channel <on|off>"""
+    global local_playback_channel_enabled
+    if state.lower() == 'on':
+        local_playback_channel_enabled = True
+        await ctx.send("Local playback of voice channel audio enabled.")
+        # Start listening if not already
+        if ctx.voice_client and not ctx.voice_client.is_listening():
+            start_listening(ctx.voice_client)
+    elif state.lower() == 'off':
+        local_playback_channel_enabled = False
+        await ctx.send("Local playback of voice channel audio disabled.")
+        # Stop listening
+        if ctx.voice_client and ctx.voice_client.is_listening():
+            stop_listening(ctx.voice_client)
+    else:
+        await ctx.send("Invalid state. Use 'on' or 'off'.")
+
+
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
@@ -151,7 +221,7 @@ async def on_message(message):
         
         # Check for invalid characters using a regular expression
         # This pattern accepts letters, numbers, spaces, and the specified punctuation
-        allowed_chars = r"^[a-zA-Z0-9 .,?!\']*$"
+        allowed_chars = r"^[a-zA-Z0-9 .,?!\'\n:]*$"
         if not re.match(allowed_chars, message.content):
             await message.channel.send("Sorry, your message contains special characters that are not allowed. Please only use letters, numbers, spaces, and the following punctuation: ., ?, !, '")
             return
@@ -167,14 +237,33 @@ async def on_message(message):
         user_throttles[user_id] = current_time
         
 
+        content_to_write = ""
+        # Check if the message is structured (e.g., "1: Hello", "2: World")
+        if re.match(r"^\d:\s", message.content):
+            lines = message.content.split('\n')
+            processed_lines = []
+            for line in lines:
+                speaker_match = re.match(r"^(1|2):\s(.*)", line)
+                if speaker_match:
+                    speaker_num = speaker_match.group(1)
+                    speaker_text = speaker_match.group(2)
+                    processed_lines.append(f"Speaker {speaker_num}: {speaker_text}")
+                else:
+                    await message.channel.send("Invalid structured message format. Each line must start with '1:' or '2:'.")
+                    return
+            content_to_write = "\n".join(processed_lines)
+        else:
+            # Unstructured message, prepend "Speaker 1:"
+            content_to_write = f"Speaker 1: {message.content}"
+
         filename = f"./txt/{message.author.name}_{uuid.uuid4().hex[:6]}.txt"
         
         # Create a user-specific log file
         with open(filename, "a", encoding="utf-8") as file:
-            file.write(f"Speaker 1: {message.content}\n")
+            file.write(f"{content_to_write}\n")
         print(f"Logged message from {message.author.name} to {filename}")
         
     await bot.process_commands(message)
 
 # Run the bot
-bot.run("0")
+bot.run(BOT_TOKEN)
