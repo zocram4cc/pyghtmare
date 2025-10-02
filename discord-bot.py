@@ -7,7 +7,9 @@ import time
 import re
 import uuid
 import subprocess
+import threading
 from discord.ext import voice_recv
+from api.api import create_api_server
 
 # Create a subfolder for model input
 if not os.path.exists("./txt"):
@@ -24,7 +26,7 @@ GUILD_ID = int(os.environ.get("GUILD_ID", 0))
 VOICE_CHANNEL_ID = int(os.environ.get("VOICE_CHANNEL_ID", 0))
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "0")
 OUTPUTS_FOLDER = "./outputs"
-THROTTLE_TIME = 30 # seconds
+THROTTLE_TIME = 45 # seconds
 CHARACTER_LIMIT = 250
 is_muted = False
 local_playback_bot_enabled = os.environ.get('LOCAL_PLAYBACK_BOT', 'false').lower() in ('true', '1', 't')
@@ -67,7 +69,7 @@ async def play_audio_from_queue():
     global is_muted
     try:
         # New: Check if the bot is muted before proceeding
-        if is_muted:
+        if is_muted and bot.voice_clients and bot.voice_clients[0].is_paused():
             return
 
         if bot.voice_clients and bot.voice_clients[0].is_connected():
@@ -87,32 +89,36 @@ async def play_audio_from_queue():
                 filepath = item['path']
                 print(f"Playing audio file: {filepath}")
 
-                if local_playback_bot_enabled:
-                    subprocess.Popen(['paplay', filepath])
-
                 def after_playing(error):
                     if error:
                         print(f'Player error: {error}')
                     print(f"Finished playing {item['name']}. Deleting file.")
                     os.remove(filepath)
 
+                def play_audio():
+                    voice_client.play(discord.FFmpegPCMAudio(filepath), after=after_playing)
 
-                voice_client.play(discord.FFmpegPCMAudio(filepath), after=after_playing)
+                if local_playback_bot_enabled:
+                    subprocess.Popen(['paplay', filepath])
+
+                threading.Thread(target=play_audio).start()
 
     except discord.errors.ClientException as e:
         print(f"ClientException: {e}. Bot not connected to voice. Retrying...")
 
-# New: Mute command
 @bot.command()
 @commands.has_permissions(stream=True)
 async def mute(ctx):
     """Mutes the bot's voice playback."""
     global is_muted
+    if is_muted:
+        await ctx.send("Bot is already muted.")
+        return
     is_muted = True
 
     voice_client = discord.utils.get(bot.voice_clients, guild=ctx.guild)
     if voice_client and voice_client.is_playing():
-        voice_client.stop()
+        voice_client.pause()
 
     await ctx.send("Bot voice playback has been muted.")
     print(f"{ctx.author} has muted the bot.")
@@ -120,28 +126,51 @@ async def mute(ctx):
 
 
 # New: Unmute command
-@bot.command()
-@commands.has_permissions(stream=True)
-async def unmute(ctx):
+async def _unmute():
     """Unmutes the bot's voice playback."""
     global is_muted
     is_muted = False
-    await ctx.send("Bot voice playback has been unmuted.")
-    print(f"{ctx.author} has unmuted the bot.")
+    voice_client = bot.voice_clients[0]
+    if voice_client and voice_client.is_paused():
+        voice_client.resume()
+    print("Bot voice playback has been unmuted.")
+
+
 
 class PaplaySink(voice_recv.AudioSink):
     def __init__(self):
         self.proc = subprocess.Popen(['paplay', '--raw', '--channels=2', '--rate=48000', '--format=s16le'], stdin=subprocess.PIPE)
+        self.queue = asyncio.Queue()
+        self.loop = asyncio.get_event_loop()
+        self.write_task = self.loop.create_task(self._write_to_paplay())
 
     def wants_opus(self):
         return False
 
     def write(self, user, data):
-        if self.proc.stdin:
-            self.proc.stdin.write(data.pcm)
+        # Put data into the queue; _write_to_paplay will handle the actual writing
+        self.loop.call_soon_threadsafe(self.queue.put_nowait, data.pcm)
+
+    async def _write_to_paplay(self):
+        while True:
+            pcm_data = await self.queue.get()
+            if pcm_data is None:  # Sentinel to stop the task
+                break
+            try:
+                self.proc.stdin.write(pcm_data)
+            except BrokenPipeError:
+                print("Paplay process pipe broken, stopping write task.")
+                break
+            except Exception as e:
+                print(f"Error writing to paplay: {e}")
 
     def cleanup(self):
-        self.proc.kill()
+        if self.write_task and not self.write_task.done():
+            self.loop.call_soon_threadsafe(self.queue.put_nowait, None) # Send sentinel
+            self.loop.call_soon_threadsafe(self.write_task.cancel) # Cancel the task
+        if self.proc.poll() is None: # Check if process is still running
+            self.proc.kill()
+        self.proc.wait() # Wait for the process to terminate
 
 def start_listening(voice_client):
     sink = PaplaySink()
@@ -231,7 +260,7 @@ async def on_message(message):
             last_message_time = user_throttles[user_id]
             if current_time - last_message_time < THROTTLE_TIME:
                 print(f"Throttled message from {message.author}. Time remaining: {THROTTLE_TIME - (current_time - last_message_time):.2f}s")
-                await message.channel.send("Slow down! You can only send a message every 20 seconds.")
+                await message.channel.send(f"Slow down! You can only send a message every {THROTTLE_TIME} seconds.")
                 return
 
         user_throttles[user_id] = current_time
@@ -265,5 +294,52 @@ async def on_message(message):
         
     await bot.process_commands(message)
 
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member == bot.user and after.mute:
+        is_muted = True
+        voice_client = discord.utils.get(bot.voice_clients, guild=member.guild)
+        if voice_client and voice_client.is_playing():
+            voice_client.pause()
+        print("Bot was server muted.")
+    elif member == bot.user and not after.mute:
+        is_muted = False
+        voice_client = discord.utils.get(bot.voice_clients, guild=member.guild)
+        if voice_client and voice_client.is_paused():
+            voice_client.resume()
+        print("Bot was server unmuted.")
+
+@bot.command()
+@commands.has_permissions(stream=True)
+async def unmute(ctx):
+    """Unmutes the bot's voice playback."""
+    global is_muted
+    if not is_muted:
+        await ctx.send("Bot is not muted.")
+        return
+    await _unmute()
+    await ctx.send("Bot voice playback has been unmuted.")
+    print(f"{ctx.author} has unmuted the bot.")
+
+async def mute_for(duration):
+    global is_muted
+    is_muted = True
+    voice_client = bot.voice_clients[0]
+    if voice_client and voice_client.is_playing():
+        voice_client.pause()
+    print(f"Bot muted for {duration} seconds.")
+    await asyncio.sleep(duration)
+    await _unmute()
+    print("Bot unmuted.")
+
+bot.mute_for = mute_for
+
 # Run the bot
-bot.run(BOT_TOKEN)
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    bot.loop = loop
+    api_server = create_api_server(bot, loop)
+    api_thread = threading.Thread(target=api_server, daemon=True)
+    api_thread.start()
+    bot.run(BOT_TOKEN)
