@@ -143,9 +143,9 @@ async def start_api_server():
     
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    site = web.TCPSite(runner, '0.0.0.0', 31335)
     await site.start()
-    print("✅ Web API server is running on http://0.0.0.0:8080")
+    print("✅ Web API server is running on http://0.0.0.0:31335")
 
 async def setup_hook():
     """This function is called once before the bot logs in."""
@@ -184,8 +184,7 @@ async def on_message(message):
     # Reject messages if muted
     if is_muted:
         if isinstance(message.channel, discord.DMChannel):
-            await message.channel.send("The bot is currently muted and cannot process messages.")
-        return
+            await message.channel.send("By the way the bot is muted, you may have to wait.")
 
     # (The rest of your on_message logic remains unchanged)
     if isinstance(message.channel, discord.DMChannel):
@@ -197,7 +196,7 @@ async def on_message(message):
         allowed_chars = r"^[a-zA-Z0-9 .,?!\'\n:]*$"
         if not re.match(allowed_chars, message.content):
             await message.channel.send("Sorry, your message contains special characters that are not allowed.")
-            return
+            #return
         if user_id in user_throttles and current_time - user_throttles[user_id] < THROTTLE_TIME:
             await message.channel.send(f"Slow down! You can only send a message every {THROTTLE_TIME} seconds.")
             return
