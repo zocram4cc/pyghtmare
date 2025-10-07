@@ -206,7 +206,7 @@ async def on_message(message):
             lines = message.content.split('\n')
             processed_lines = []
             for line in lines:
-                speaker_match = re.match(r"^(1|2):\s(.*)", line)
+                speaker_match = re.match(r"^(1|2|3):\s(.*)", line)
                 if speaker_match:
                     speaker_num, speaker_text = speaker_match.groups()
                     processed_lines.append(f"Speaker {speaker_num}: {speaker_text}")

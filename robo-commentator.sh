@@ -1,0 +1,1 @@
+inotifywait -m -e create --format '%w%f' comm_txt | while read -l f; string match -q '*.txt' (basename "$f"); and set base (basename "$f" .txt); and espeak-ng -f "$f" -w outputs/$base.wav; and rm "$f"; end
