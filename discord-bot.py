@@ -12,6 +12,8 @@ from discord.ext import voice_recv
 from aiohttp import web
 import json
 import signal
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 # Create a subfolder for model input
 if not os.path.exists("./txt"):
@@ -28,8 +30,8 @@ GUILD_ID = int(os.environ.get("GUILD_ID", 0))
 VOICE_CHANNEL_ID = int(os.environ.get("VOICE_CHANNEL_ID", 0))
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "0")
 OUTPUTS_FOLDER = "./outputs"
-THROTTLE_TIME = 45 # seconds
-CHARACTER_LIMIT = 250
+THROTTLE_TIME = 30 # seconds
+CHARACTER_LIMIT = 200
 
 # Playback settings
 local_playback_bot_enabled = os.environ.get('LOCAL_PLAYBACK_BOT', 'false').lower() in ('true', '1', 't')
@@ -42,8 +44,27 @@ local_playback_process = None
 # User-specific message queues for throttling
 user_throttles = {}
 
+# --- Playback Control ---
 # Queue for voice playback
 voice_queue = asyncio.Queue()
+# Event to signal that a playback has finished and the next one can start
+playback_finished = asyncio.Event()
+# Event to pause the playback worker when muted
+play_allowed = asyncio.Event()
+play_allowed.set() # Set by default to allow playing
+
+# --- Watchdog File System Handler ---
+class AudioFileHandler(FileSystemEventHandler):
+    """Handles file system events to queue new audio files for playback."""
+    def __init__(self, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
+        self.queue = queue
+        self.loop = loop
+
+    def on_created(self, event):
+        if not event.is_directory and event.src_path.endswith('.wav'):
+            print(f"Watchdog detected new file: {event.src_path}")
+            # Use call_soon_threadsafe because watchdog runs in a separate thread
+            self.loop.call_soon_threadsafe(self.queue.put_nowait, event.src_path)
 
 # --- Mute and Unmute Core Logic ---
 
@@ -55,19 +76,21 @@ async def _mute():
 
     print("Muting bot...")
     is_muted = True
+    play_allowed.clear()  # PAUSE the playback worker
 
     if mute_timer_task and not mute_timer_task.done():
         mute_timer_task.cancel()
         mute_timer_task = None
-    
+
     # Pause the Discord voice client
-    if bot.voice_clients:
-        vc = bot.voice_clients[0]
-        if vc.is_playing():
+    guild = bot.get_guild(GUILD_ID)
+    if guild:
+        vc = discord.utils.get(bot.voice_clients, guild=guild)
+        if vc and vc.is_playing():
             vc.pause()
             print("Audio playback paused.")
 
-    # --- FIX: Pause the local playback subprocess ---
+    # Pause the local playback subprocess
     if local_playback_process and local_playback_process.poll() is None:
         try:
             local_playback_process.send_signal(signal.SIGSTOP)
@@ -84,19 +107,21 @@ async def _unmute():
 
     print("Unmuting bot...")
     is_muted = False
-    
+    play_allowed.set()  # RESUME the playback worker
+
     if mute_timer_task and not mute_timer_task.done():
         mute_timer_task.cancel()
         mute_timer_task = None
 
     # Resume the Discord voice client
-    if bot.voice_clients:
-        vc = bot.voice_clients[0]
-        if vc.is_paused():
+    guild = bot.get_guild(GUILD_ID)
+    if guild:
+        vc = discord.utils.get(bot.voice_clients, guild=guild)
+        if vc and vc.is_paused():
             vc.resume()
             print("Audio playback resumed.")
 
-    # --- FIX: Resume the local playback subprocess ---
+    # Resume the local playback subprocess
     if local_playback_process and local_playback_process.poll() is None:
         try:
             local_playback_process.send_signal(signal.SIGCONT)
@@ -158,8 +183,42 @@ bot.setup_hook = setup_hook
 @bot.event
 async def on_ready():
     print(f'Bot logged in as {bot.user}')
-    check_voice_channel.start()
-    play_audio_from_queue.start()
+    
+    # Using a bot attribute to ensure this runs only once
+    if not hasattr(bot, 'is_ready_once'):
+        bot.is_ready_once = True
+        print("Performing one-time setup...")
+
+        # Ensure the outputs folder exists
+        if not os.path.exists(OUTPUTS_FOLDER):
+            os.makedirs(OUTPUTS_FOLDER)
+
+        # Start watchdog observer to queue new audio files
+        event_handler = AudioFileHandler(voice_queue, bot.loop)
+        observer = Observer()
+        observer.schedule(event_handler, OUTPUTS_FOLDER, recursive=False)
+        observer.start()
+        print(f"👀 Watchdog is now monitoring the {OUTPUTS_FOLDER} directory.")
+
+        # Set the event initially to allow the first track to play
+        playback_finished.set()
+
+        # Start background tasks
+        check_voice_channel.start()
+        bot.loop.create_task(play_audio_worker())
+        print("🔊 Playback worker has started.")
+
+@bot.event
+async def on_connect():
+    print("Bot connected to Discord.")
+
+@bot.event
+async def on_disconnect():
+    print("Bot disconnected from Discord. Attempting to reconnect...")
+
+@bot.event
+async def on_resume():
+    print("Bot has resumed its session.")
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -193,10 +252,11 @@ async def on_message(message):
         if len(message.content) > CHARACTER_LIMIT:
             await message.channel.send(f"Sorry, your message is too long. Please keep it under {CHARACTER_LIMIT} characters.")
             return
-        allowed_chars = r"^[a-zA-Z0-9 .,?!\'\n:]*$"
+#        allowed_chars = r"^[a-zA-Z0-9 .,?!'\n:]*$"
+        allowed_chars = r"^[a-zA-Z0-9 .,?!'\n:<>/]*$"
         if not re.match(allowed_chars, message.content):
             await message.channel.send("Sorry, your message contains special characters that are not allowed.")
-            #return
+            return
         if user_id in user_throttles and current_time - user_throttles[user_id] < THROTTLE_TIME:
             await message.channel.send(f"Slow down! You can only send a message every {THROTTLE_TIME} seconds.")
             return
@@ -225,76 +285,142 @@ async def on_message(message):
 
 # --- Bot Tasks ---
 
-@tasks.loop(count=1)
+@tasks.loop(seconds=15)
 async def check_voice_channel():
     await bot.wait_until_ready()
     guild = bot.get_guild(GUILD_ID)
-    if guild:
+    if not guild:
+        print("Guild not found. Make sure the bot is in the guild.")
+        return
+
+    vc = discord.utils.get(bot.voice_clients, guild=guild)
+    
+    if not vc or not vc.is_connected():
+        print("Not connected to voice channel. Attempting to connect...")
         voice_channel = guild.get_channel(VOICE_CHANNEL_ID)
         if voice_channel and isinstance(voice_channel, discord.VoiceChannel):
-            try:
-                vc = await voice_channel.connect(cls=voice_recv.VoiceRecvClient)
-                print(f"Joined voice channel: {voice_channel.name}")
-                if local_playback_channel_enabled:
-                    start_listening(vc)
-            except Exception as e:
-                print(f"Failed to join voice channel: {e}")
+            for i in range(3): # Retry 3 times
+                try:
+                    await asyncio.wait_for(voice_channel.connect(cls=voice_recv.VoiceRecvClient), timeout=30.0)
+                    print(f"Successfully connected to voice channel: {voice_channel.name}")
+                    break # Exit loop on success
+                except Exception as e:
+                    print(f"Failed to connect to voice channel (attempt {i+1}/3): {e}")
+                    await asyncio.sleep(5) # Wait 5 seconds before retrying
+            else: # This runs if the loop completes without breaking
+                print("Failed to connect to voice channel after multiple retries.")
         else:
             print("Voice channel not found or invalid.")
-    else:
-        print("Guild not found. Make sure the bot is in the guild.")
+    elif vc.channel.id != VOICE_CHANNEL_ID:
+        voice_channel = guild.get_channel(VOICE_CHANNEL_ID)
+        if voice_channel:
+            try:
+                await vc.move_to(voice_channel)
+                print(f"Moved to voice channel: {voice_channel.name}")
+            except Exception as e:
+                print(f"Failed to move to voice channel: {e}")
 
-@tasks.loop(seconds=5)
-async def play_audio_from_queue():
-    global local_playback_process # Add global accessor
+    # Re-get vc and check listening status
+    vc = discord.utils.get(bot.voice_clients, guild=guild)
+    if vc and vc.is_connected() and local_playback_channel_enabled and not vc.is_listening():
+        start_listening(vc)
+
+async def play_audio_worker():
+    """A dedicated worker that plays audio from the queue."""
+    global local_playback_process
     await bot.wait_until_ready()
 
-    if is_muted:
-        return
+    while True:
+        # Get the next file to play. This will block until a file is available.
+        filepath = await voice_queue.get()
 
-    if not bot.voice_clients:
-        return
+        # Now, wait if the bot is muted. This prevents playing a new track after a mute is requested.
+        await play_allowed.wait()
 
-    vc = bot.voice_clients[0]
-    if not vc.is_connected():
-        return
-        
-    for filename in os.listdir(OUTPUTS_FOLDER):
-        if filename.endswith(".wav"):
-            filepath = os.path.join(OUTPUTS_FOLDER, filename)
-            if not any(item['path'] == filepath for item in voice_queue._queue):
-                await voice_queue.put({'path': filepath, 'name': filename})
-                print(f"Added {filename} to the voice queue.")
+        # Wait for the previous track to finish before starting a new one.
+        await playback_finished.wait()
 
-    if not vc.is_playing() and not voice_queue.empty():
-        if local_playback_process:
-            local_playback_process = None
+        guild = bot.get_guild(GUILD_ID)
+        vc = discord.utils.get(bot.voice_clients, guild=guild)
 
-        item = await voice_queue.get()
-        filepath = item['path']
-        print(f"Playing audio file: {filepath}")
-
-        def after_playing(error):
-            # --- THIS IS THE FIX ---
-            # Use 'global' because the variable is defined at the top of the script
-            global local_playback_process 
-            
-            if error:
-                print(f'Player error: {error}')
-            print(f"Finished playing {item['name']}. Deleting file.")
+        # Ensure we are in a voice channel
+        if not vc or not vc.is_connected():
+            print(f"Not connected to voice, discarding {os.path.basename(filepath)}")
             if os.path.exists(filepath):
                 os.remove(filepath)
-            
-            # Clean up the process reference after playback
-            if local_playback_process:
-                if local_playback_process.poll() is None:
-                    local_playback_process.kill()
-                local_playback_process = None
+            voice_queue.task_done()
+            # The check_voice_channel task should handle reconnecting.
+            # We must set playback_finished here to allow the worker to process the next item
+            # in case the connection returns. Otherwise, the worker would be stuck.
+            playback_finished.set()
+            continue
 
-        vc.play(discord.FFmpegPCMAudio(filepath), after=after_playing)
-        
-        if local_playback_bot_enabled:
-            local_playback_process = subprocess.Popen(['paplay', filepath])
+        # Clear the event, ready for the new playback
+        playback_finished.clear()
+
+        print(f"Playing audio file: {filepath}")
+
+        discord_finished_event = asyncio.Event()
+
+        def after_playing_callback(error):
+            if error:
+                print(f'Player error: {error}')
+            bot.loop.call_soon_threadsafe(discord_finished_event.set)
+
+        try:
+            # Reset global process handle at the start of a new playback
+            local_playback_process = None
+
+            # Start Discord playback
+            print("Starting Discord playback...")
+            vc.play(discord.FFmpegPCMAudio(filepath), after=after_playing_callback)
+            print("Discord playback started.")
+
+            # Start local playback if enabled
+            if local_playback_bot_enabled:
+                print("Attempting to start local playback with ffplay...")
+                try:
+                    with open(os.devnull, 'w') as devnull:
+                        local_playback_process = subprocess.Popen(
+                            ['ffplay', '-nodisp', '-autoexit', filepath],
+                            stdout=devnull,
+                            stderr=devnull
+                        )
+                    print("ffplay process started.")
+                except Exception as e:
+                    print(f"Error starting ffplay subprocess: {e}")
+
+            # --- Wait for completion ---
+            # 1. Wait for Discord playback to finish
+            await discord_finished_event.wait()
+
+            # 2. Wait for local playback to finish (if it was started)
+            if local_playback_process and local_playback_process.poll() is None:
+                print("Discord playback finished. Waiting for local playback...")
+                # Use an executor to avoid blocking the event loop.
+                await bot.loop.run_in_executor(None, local_playback_process.wait)
+                print("Local playback finished.")
+
+        except Exception as e:
+            print(f"Error during playback: {e}")
+            # Ensure local process is killed if an error occurs
+            if local_playback_process and local_playback_process.poll() is None:
+                print("Killing local playback process due to error.")
+                local_playback_process.kill()
+                local_playback_process.wait()
+        finally:
+            # --- Cleanup ---
+            local_playback_process = None # Clear the global handle
+            print(f"Playback finished for {os.path.basename(filepath)}. Deleting file.")
+            if os.path.exists(filepath):
+                try:
+                    os.remove(filepath)
+                except OSError as e:
+                    print(f"Error deleting file {filepath}: {e}")
+
+            # Signal that the worker is ready for the next track
+            playback_finished.set()
+            voice_queue.task_done()
 
 # --- Discord Commands ---
 

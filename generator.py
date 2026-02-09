@@ -154,7 +154,7 @@ class TxtFileHandler(FileSystemEventHandler):
             outputs = self.model.generate(
                 **inputs,
                 cfg_scale=self.cfg_scale,
-                max_new_tokens=None,
+                max_new_tokens=4096,
                 generation_config={'do_sample': False},
                 verbose=True,
                 tokenizer=self.processor.tokenizer  # MUST be passed
